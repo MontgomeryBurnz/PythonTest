@@ -6,6 +6,7 @@ import io
 import re
 import textwrap
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -75,10 +76,50 @@ class ReportAnalysis:
     power_pivot_present: bool
     extra_notes: List[str]
     csv_preview: Optional[pd.DataFrame] = None
+    sheet_logic: List["WorksheetLogicSummary"] = field(default_factory=list)
+
+
+@dataclass
+class WorksheetLogicSummary:
+    sheet_name: str
+    formula_count: int
+    unique_functions: List[str]
+    insights: List[str]
+    sample_formulas: List[str]
 
 
 POWER_QUERY_NS = {"pq": "http://schemas.microsoft.com/office/PowerQuery/2013/Main"}
 
+
+@dataclass
+class SheetDefinition:
+    sheet_name: str
+    path: str
+
+
+FORMULA_FUNCTION_HINTS: Dict[str, str] = {
+    "VLOOKUP": "Uses VLOOKUP to map keys from another table.",
+    "XLOOKUP": "Uses XLOOKUP for flexible lookups across ranges.",
+    "HLOOKUP": "Performs horizontal lookups (HLOOKUP).",
+    "INDEX": "Employs INDEX to retrieve values by position.",
+    "MATCH": "Uses MATCH to locate positions within ranges (often paired with INDEX).",
+    "SUMIF": "Aggregates values conditionally via SUMIF.",
+    "SUMIFS": "Aggregates values with multiple criteria via SUMIFS.",
+    "COUNTIF": "Counts records matching criteria (COUNTIF).",
+    "COUNTIFS": "Counts records matching multiple criteria (COUNTIFS).",
+    "AVERAGEIF": "Averages values matching criteria (AVERAGEIF).",
+    "AVERAGEIFS": "Averages values with multiple criteria (AVERAGEIFS).",
+    "IF": "Contains IF statements for branching logic.",
+    "IFS": "Uses IFS for multi-branch conditional logic.",
+    "SUMPRODUCT": "Uses SUMPRODUCT for array-style aggregations (often weighted sums).",
+    "INDIRECT": "Employs INDIRECT to build references dynamically.",
+    "OFFSET": "Uses OFFSET to move references dynamically – review for volatility.",
+    "FILTER": "Applies FILTER to subset data dynamically.",
+    "UNIQUE": "Generates distinct lists with UNIQUE.",
+    "SORT": "Sorts results dynamically using SORT.",
+    "LET": "Defines intermediate variables with LET for readable formulas.",
+    "GETPIVOTDATA": "Pulls values out of PivotTables via GETPIVOTDATA.",
+}
 
 def human_size(num: int) -> str:
     for unit in ["B", "KB", "MB", "GB"]:
@@ -186,16 +227,106 @@ def extract_metadata(zf: zipfile.ZipFile) -> Dict[str, str]:
     return meta
 
 
-def extract_sheet_names(zf: zipfile.ZipFile) -> List[str]:
-    names: List[str] = []
+def get_sheet_definitions(zf: zipfile.ZipFile) -> List[SheetDefinition]:
     workbook = read_xml(zf, "xl/workbook.xml")
     if workbook is None:
-        return names
-    for sheet in workbook.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"):
-        name = sheet.get("name")
-        if name:
-            names.append(name)
-    return names
+        return []
+
+    rels = read_xml(zf, "xl/_rels/workbook.xml.rels")
+    rel_map: Dict[str, str] = {}
+    if rels is not None:
+        ns_rel = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+        for rel in rels.findall(f"{ns_rel}Relationship"):
+            rel_id = rel.get("Id")
+            target = rel.get("Target")
+            if rel_id and target:
+                rel_map[rel_id] = target
+
+    ns_main = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    ns_rel_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    definitions: List[SheetDefinition] = []
+    for sheet in workbook.findall(f"{ns_main}sheet"):
+        name = sheet.get("name") or "Unnamed sheet"
+        rel_id = sheet.get(ns_rel_attr)
+        target = rel_map.get(rel_id, f"worksheets/sheet{sheet.get('sheetId', '')}.xml")
+        target_path = target if target.startswith("xl/") else f"xl/{target}"
+        definitions.append(SheetDefinition(sheet_name=name, path=target_path))
+    return definitions
+
+
+def extract_formula_functions(formula: str) -> List[str]:
+    matches = re.findall(r"([A-Z_][A-Z0-9_\.]+)\s*\(", formula, flags=re.IGNORECASE)
+    return [match.upper() for match in matches]
+
+
+def summarize_formula_logic(sheet_name: str, formulas: Sequence[str]) -> Optional[WorksheetLogicSummary]:
+    cleaned = [f.strip() for f in formulas if f and f.strip()]
+    if not cleaned:
+        return None
+
+    function_counts: Counter[str] = Counter()
+    cross_sheet = False
+    structured_refs = False
+    array_formulas = False
+
+    for formula in cleaned:
+        function_counts.update(extract_formula_functions(formula))
+        if "!" in formula:
+            cross_sheet = True
+        if "[" in formula and "]" in formula:
+            structured_refs = True
+        if formula.startswith("{") and formula.endswith("}"):
+            array_formulas = True
+
+    insights: List[str] = []
+    for func in function_counts.keys():
+        hint = FORMULA_FUNCTION_HINTS.get(func)
+        if hint and hint not in insights:
+            insights.append(hint)
+
+    if cross_sheet:
+        insights.append("References other worksheets (sheet!cell) within formulas.")
+    if structured_refs:
+        insights.append("Uses structured table references like Table[Column].")
+    if array_formulas:
+        insights.append("Contains legacy array formulas (curly braces).")
+
+    if not insights:
+        insights.append("Formulas detected; review samples below for context.")
+
+    unique_functions = [name for name, _ in function_counts.most_common(8)]
+
+    samples: List[str] = []
+    seen: set[str] = set()
+    for formula in cleaned:
+        if formula in seen:
+            continue
+        seen.add(formula)
+        samples.append(textwrap.shorten("=" + formula, width=110, placeholder="…"))
+        if len(samples) >= 3:
+            break
+
+    return WorksheetLogicSummary(
+        sheet_name=sheet_name,
+        formula_count=len(cleaned),
+        unique_functions=unique_functions,
+        insights=insights,
+        sample_formulas=samples,
+    )
+
+
+def extract_sheet_formula_logic(zf: zipfile.ZipFile, sheets: Sequence[SheetDefinition]) -> List[WorksheetLogicSummary]:
+    summaries: List[WorksheetLogicSummary] = []
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    for sheet in sheets:
+        root = read_xml(zf, sheet.path)
+        if root is None:
+            continue
+        formulas = [node.text for node in root.findall(f".//{ns}f") if node.text]
+        summary = summarize_formula_logic(sheet.sheet_name, formulas)
+        if summary is not None:
+            summaries.append(summary)
+    return summaries
 
 
 def summarize_m_script(script: str) -> List[str]:
@@ -359,18 +490,20 @@ def analyse_excel_file(name: str, data: bytes) -> ReportAnalysis:
             )
         buffer.seek(0)
         with zipfile.ZipFile(buffer) as zf:
+            sheets = get_sheet_definitions(zf)
             return ReportAnalysis(
                 name=name,
                 file_type="Excel OpenXML workbook",
                 size_bytes=len(data),
                 analysis_ts=datetime.utcnow(),
                 metadata=extract_metadata(zf),
-                sheets=extract_sheet_names(zf),
+                sheets=[sheet.sheet_name for sheet in sheets],
                 macros=extract_macros(name, data),
                 power_queries=extract_power_queries(zf),
                 connections=extract_connections(zf),
                 power_pivot_present=detect_power_pivot(zf),
                 extra_notes=[],
+                sheet_logic=extract_sheet_formula_logic(zf, sheets),
             )
 
 
@@ -449,6 +582,27 @@ def render_macro_section(summary: MacroSummary) -> None:
             st.code(module.code, language="vb")
 
 
+def render_sheet_logic_section(entries: Sequence[WorksheetLogicSummary]) -> None:
+    if not entries:
+        st.info("No worksheet formulas detected in the uploaded workbook.")
+        return
+    for summary in entries:
+        title = f"Sheet: {summary.sheet_name} ({summary.formula_count} formula{'s' if summary.formula_count != 1 else ''})"
+        with st.expander(title, expanded=False):
+            if summary.unique_functions:
+                st.markdown("**Top functions used**")
+                st.write(
+                    ", ".join(summary.unique_functions[:8])
+                )
+            if summary.insights:
+                st.markdown("**Translation**")
+                for insight in summary.insights:
+                    st.write(f"- {insight}")
+            if summary.sample_formulas:
+                st.markdown("**Sample formulas**")
+                st.code("\n".join(summary.sample_formulas), language="text")
+
+
 def render_query_section(queries: Sequence[PowerQuerySummary]) -> None:
     if not queries:
         st.info("No Power Query definitions found.")
@@ -496,6 +650,9 @@ def render_analysis(result: ReportAnalysis) -> None:
             st.json(result.metadata)
     if result.sheets:
         st.caption("Worksheets detected: " + ", ".join(result.sheets))
+
+    st.markdown("#### Worksheet Logic (formulas)")
+    render_sheet_logic_section(result.sheet_logic)
 
     st.markdown("#### Macros / VBA")
     render_macro_section(result.macros)

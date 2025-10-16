@@ -3,7 +3,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Literal, Set
 
 import streamlit as st
 
@@ -68,6 +68,15 @@ class ComparisonRecord:
         return True
 
 
+@dataclass
+class AnalysisIssue:
+    line: int
+    severity: Literal["info", "warning", "error"]
+    message: str
+    recommendation: Optional[str] = None
+    context: Optional[str] = None
+
+
 def resolve_path(base: Path, value: str) -> Path:
     # Resolve user-provided paths relative to the working directory/panel entries.
     path = Path(value).expanduser()
@@ -120,6 +129,249 @@ def write_bytes(path: Path, content: bytes) -> None:
     # Persist uploaded EXP artifacts to disk within the working tree.
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+
+
+def analyze_tsql(content: str) -> List[AnalysisIssue]:
+    # Heuristic scan of a T-SQL script to highlight Snowflake incompatibilities.
+    issues: List[AnalysisIssue] = []
+    lines = content.splitlines()
+
+    def add_issue(
+        line_index: int,
+        severity: Literal["info", "warning", "error"],
+        message: str,
+        recommendation: Optional[str] = None,
+        context: Optional[str] = None,
+    ) -> None:
+        issues.append(
+            AnalysisIssue(
+                line=line_index,
+                severity=severity,
+                message=message,
+                recommendation=recommendation,
+                context=context,
+            )
+        )
+
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        upper = stripped.upper()
+        context = stripped or None
+
+        if not stripped:
+            continue
+
+        if upper == "GO":
+            add_issue(
+                idx,
+                "warning",
+                "Batch separator `GO` is not supported in Snowflake.",
+                "Remove `GO` statements and execute statements sequentially.",
+                context,
+            )
+
+        if re.match(r"^\s*USE\s+", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "`USE` statements are not supported in Snowflake sessions.",
+                "Establish database/schema with `USE DATABASE` / `USE SCHEMA` outside the script or rely on the session context.",
+                context,
+            )
+
+        if re.search(r"\bIDENTITY\s*\(", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "error",
+                "IDENTITY columns are not supported in Snowflake.",
+                "Replace with a sequence and default value (e.g., `sequence_name.NEXTVAL`).",
+                context,
+            )
+
+        if re.search(r"\bTOP\s+\d+", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "`TOP` syntax is not available in Snowflake.",
+                "Rewrite the query to use `LIMIT n` (optionally with `ORDER BY`).",
+                context,
+            )
+
+        if re.search(r"\[[^\]]+\]", line):
+            add_issue(
+                idx,
+                "info",
+                "Bracket-delimited identifiers should be quoted with double quotes in Snowflake.",
+                'Replace `[identifier]` with `"identifier"`.',
+                context,
+            )
+
+        if re.search(r"\bNVARCHAR\b", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "NVARCHAR is not a Snowflake data type.",
+                "Use `VARCHAR` or `VARCHAR(n)`.",
+                context,
+            )
+
+        if re.search(r"\bNCHAR\b", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "NCHAR is not a Snowflake data type.",
+                "Use `CHAR` or `CHAR(n)`.",
+                context,
+            )
+
+        if re.search(r"\bDATETIME\b", line, re.IGNORECASE) or re.search(r"\bSMALLDATETIME\b", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "DATETIME/SMALLDATETIME types should be mapped to Snowflake TIMESTAMP variants.",
+                "Use `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as appropriate.",
+                context,
+            )
+
+        if re.search(r"\bMONEY\b", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "MONEY type is not available in Snowflake.",
+                "Use `NUMBER(38, 4)` or a numeric type that preserves required scale.",
+                context,
+            )
+
+        if re.search(r"\bBIT\b", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "BIT type is not supported in Snowflake.",
+                "Use `BOOLEAN` instead.",
+                context,
+            )
+
+        if re.search(r"\bUNIQUEIDENTIFIER\b", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "info",
+                "UNIQUEIDENTIFIER has no direct Snowflake equivalent.",
+                "Represent GUID values as `VARCHAR` or use Snowflake UUID functions.",
+                context,
+            )
+
+        if re.search(r"\bGETDATE\s*\(\s*\)", line, re.IGNORECASE) or re.search(r"\bSYSDATETIME\s*\(\s*\)", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "info",
+                "Date/time functions differ between SQL Server and Snowflake.",
+                "Use `CURRENT_TIMESTAMP` or `CURRENT_DATE` as needed.",
+                context,
+            )
+
+        if re.search(r"\bISNULL\s*\(", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "info",
+                "ISNULL behaves differently in Snowflake.",
+                "Replace with `COALESCE` to support multiple arguments.",
+                context,
+            )
+
+        if re.search(r"\bCONVERT\s*\(", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "info",
+                "CONVERT function is not available in Snowflake.",
+                "Use `CAST` or `TO_<TYPE>` helpers.",
+                context,
+            )
+
+        if re.search(r"\bLEN\s*\(", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "info",
+                "LEN should be replaced in Snowflake.",
+                "Use `LENGTH` or `CHAR_LENGTH`.",
+                context,
+            )
+
+        if re.search(r"@@IDENTITY|SCOPE_IDENTITY", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "warning",
+                "SQL Server identity retrieval functions are unavailable in Snowflake.",
+                "Use sequences and capture values explicitly (e.g., `LAST_VALUE` from sequence).",
+                context,
+            )
+
+        if re.search(r"\bEXEC\s+", line, re.IGNORECASE):
+            add_issue(
+                idx,
+                "info",
+                "Stored procedure execution uses different syntax in Snowflake.",
+                "Replace with `CALL procedure_name(arguments);`.",
+                context,
+            )
+
+        if re.search(r"#\w+", line):
+            add_issue(
+                idx,
+                "warning",
+                "Temporary tables defined with `#name` are SQL Server specific.",
+                "Use Snowflake temporary tables (`CREATE TEMP TABLE`) without the hash prefix.",
+                context,
+            )
+
+    return issues
+
+
+def transform_tsql_to_snow(content: str) -> Tuple[str, List[str]]:
+    # Apply conservative text transformations to produce a SnowSQL starting point.
+    notes: List[str] = []
+    seen: Set[str] = set()
+
+    def add_note(text: str) -> None:
+        if text not in seen:
+            seen.add(text)
+            notes.append(text)
+
+    lines: List[str] = []
+    for line in content.splitlines():
+        if line.strip().upper() == "GO":
+            add_note("Removed `GO` batch separators.")
+            continue
+        lines.append(line)
+
+    text = "\n".join(lines)
+
+    bracket_pattern = re.compile(r"\[([^\]]+)\]")
+    if bracket_pattern.search(text):
+        add_note("Converted bracket-delimited identifiers to double quotes.")
+        text = bracket_pattern.sub(lambda match: f'"{match.group(1)}"', text)
+
+    def apply(pattern: str, replacement: str, note: str, flags: int = re.IGNORECASE) -> None:
+        nonlocal text
+        new_text, count = re.subn(pattern, replacement, text, flags=flags)
+        if count:
+            add_note(note)
+            text = new_text
+
+    apply(r"\bGETDATE\s*\(\s*\)", "CURRENT_TIMESTAMP", "Replaced GETDATE() with CURRENT_TIMESTAMP.")
+    apply(r"\bSYSDATETIME\s*\(\s*\)", "CURRENT_TIMESTAMP", "Replaced SYSDATETIME() with CURRENT_TIMESTAMP.")
+    apply(r"\bISNULL\s*\(", "COALESCE(", "Replaced ISNULL with COALESCE.")
+    apply(r"\bNVARCHAR\s*\(", "VARCHAR(", "Replaced NVARCHAR with VARCHAR.")
+    apply(r"\bNVARCHAR\b", "VARCHAR", "Replaced NVARCHAR with VARCHAR.")
+    apply(r"\bNCHAR\s*\(", "CHAR(", "Replaced NCHAR with CHAR.")
+    apply(r"\bNCHAR\b", "CHAR", "Replaced NCHAR with CHAR.")
+    apply(r"\bDATETIME\b", "TIMESTAMP_NTZ", "Mapped DATETIME to TIMESTAMP_NTZ.")
+    apply(r"\bSMALLDATETIME\b", "TIMESTAMP_NTZ", "Mapped SMALLDATETIME to TIMESTAMP_NTZ.")
+    apply(r"\bMONEY\b", "NUMBER(38,4)", "Mapped MONEY to NUMBER(38,4).")
+    apply(r"\bBIT\b", "BOOLEAN", "Mapped BIT to BOOLEAN.")
+    apply(r"\bUNIQUEIDENTIFIER\b", "VARCHAR", "Represented UNIQUEIDENTIFIER as VARCHAR.")
+    apply(r"\bLEN\s*\(", "LENGTH(", "Replaced LEN with LENGTH.")
+
+    return text, notes
 
 
 def run_datacompare(
@@ -355,7 +607,7 @@ def main() -> None:
         st.subheader("Uploaded EXP File")
         if exp_path:
             st.caption(f"Stored at: {exp_path}")
-        st.text_area("EXP contents", value=exp_content, height=200)
+        st.text_area("EXP contents", value=exp_content, height=200, key="exp_source_view")
         st.download_button(
             label="Download uploaded EXP",
             data=exp_content,
@@ -363,6 +615,35 @@ def main() -> None:
             mime="text/plain",
             key="download_uploaded_exp",
         )
+
+        # Run heuristic T-SQL analysis for Snowflake readiness.
+        findings = analyze_tsql(exp_content)
+        st.subheader("Snowflake Migration Findings")
+        if findings:
+            for issue in findings:
+                severity = issue.severity.capitalize()
+                st.markdown(f"**Line {issue.line} – {severity}:** {issue.message}")
+                if issue.context:
+                    st.code(issue.context, language="sql")
+                if issue.recommendation:
+                    st.caption(issue.recommendation)
+        else:
+            st.info("No Snowflake compatibility issues detected by the current heuristic checks.")
+
+        transformed_sql, transform_notes = transform_tsql_to_snow(exp_content)
+        st.subheader("Proposed SnowSQL")
+        st.text_area("SnowSQL candidate", value=transformed_sql, height=220, key="exp_snow_view")
+        st.download_button(
+            label="Download SnowSQL candidate",
+            data=transformed_sql,
+            file_name="exp_translated_snowsql.txt",
+            mime="text/plain",
+            key="download_snowsql_candidate",
+        )
+        if transform_notes:
+            st.markdown("**Transform Notes**")
+            for note in transform_notes:
+                st.markdown(f"- {note}")
 
     # Load comparison definitions and surface any JSON parsing issues.
     comparisons, errors = load_jsonl(comparisons_path)

@@ -116,6 +116,12 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def write_bytes(path: Path, content: bytes) -> None:
+    # Persist uploaded EXP artifacts to disk within the working tree.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
 def run_datacompare(
     action: str,
     binary: Path,
@@ -234,6 +240,38 @@ def render_path_inputs(base_default: Path) -> Tuple[Path, Path, Path, Path, Path
     )
 
 
+def render_exp_upload(workdir_path: Path) -> Tuple[Optional[Path], Optional[str]]:
+    # Allow analysts to upload an EXP text file for reference during analysis.
+    st.sidebar.subheader("EXP Upload")
+    uploaded_file = st.sidebar.file_uploader("Upload EXP file (.txt)", type=["txt"])
+
+    exp_path: Optional[Path] = None
+    exp_content: Optional[str] = None
+
+    if uploaded_file is not None:
+        data = uploaded_file.getvalue()
+        filename = uploaded_file.name or "uploaded_exp.txt"
+        safe_name = Path(filename).name
+        exp_path = workdir_path / "exp_uploads" / safe_name
+        write_bytes(exp_path, data)
+        exp_content = data.decode("utf-8", errors="replace")
+        st.sidebar.success(f"Saved EXP file to {exp_path}")
+        st.session_state["exp_file_path"] = str(exp_path)
+        st.session_state["exp_file_content"] = exp_content
+    else:
+        stored_path = st.session_state.get("exp_file_path")
+        stored_content = st.session_state.get("exp_file_content")
+        if stored_path:
+            exp_path = Path(stored_path)
+        if stored_content:
+            exp_content = stored_content
+
+    if exp_path:
+        st.sidebar.caption(f"Active EXP file: {exp_path}")
+
+    return exp_path, exp_content
+
+
 def pick_record(records: List[ComparisonRecord]) -> Optional[ComparisonRecord]:
     # Let the analyst choose which comparison entry to work on.
     if not records:
@@ -308,9 +346,23 @@ def main() -> None:
         compare_filter_path,
         config_path,
     ) = render_path_inputs(base_default)
+    exp_path, exp_content = render_exp_upload(workdir_path)
 
     st.title("EXP Analysis Workflow Assistant")
     st.caption("Guide and automate the EXP data comparison workflow.")
+
+    if exp_content:
+        st.subheader("Uploaded EXP File")
+        if exp_path:
+            st.caption(f"Stored at: {exp_path}")
+        st.text_area("EXP contents", value=exp_content, height=200)
+        st.download_button(
+            label="Download uploaded EXP",
+            data=exp_content,
+            file_name=(exp_path.name if exp_path else "uploaded_exp.txt"),
+            mime="text/plain",
+            key="download_uploaded_exp",
+        )
 
     # Load comparison definitions and surface any JSON parsing issues.
     comparisons, errors = load_jsonl(comparisons_path)
@@ -426,7 +478,7 @@ def main() -> None:
             data=st.session_state["last_find_stdout"],
             file_name="find_keys_stdout.txt",
             mime="text/plain",
-    )
+        )
 
 
 if __name__ == "__main__":
